@@ -1,12 +1,17 @@
 export const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 export const GROQ_MODELS = ['openai/gpt-oss-20b', 'openai/gpt-oss-120b'] as const;
 
+function sanitizeEnvKey(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  return raw.trim().replace(/^["']|["']$/g, '').trim();
+}
+
 export function getGroqApiKey(): string {
-  const viteKey = (import.meta.env.VITE_GROQ_API_KEY as string | undefined)?.trim();
+  const viteKey = sanitizeEnvKey(import.meta.env.VITE_GROQ_API_KEY);
   if (viteKey && viteKey !== 'MY_GROQ_API_KEY') {
     return viteKey;
   }
-  const groqKey = (import.meta.env.GROQ_API_KEY as string | undefined)?.trim();
+  const groqKey = sanitizeEnvKey(import.meta.env.GROQ_API_KEY);
   if (groqKey && groqKey !== 'MY_GROQ_API_KEY') {
     return groqKey;
   }
@@ -22,12 +27,7 @@ export async function extractPdfTextFromFile(file: File): Promise<string> {
 
 export interface GroqMessageItem {
   role: 'system' | 'user' | 'assistant';
-  content:
-    | string
-    | Array<
-        | { type: 'text'; text: string }
-        | { type: 'image_url'; image_url: { url: string } }
-      >;
+  content: string;
 }
 
 export interface StreamGroqOptions {
@@ -35,6 +35,7 @@ export interface StreamGroqOptions {
   systemPrompt: string;
   history: Array<{ role: 'user' | 'assistant'; content: string }>;
   userText: string;
+  userName?: string;
   attachment?: {
     kind: 'image' | 'document';
     name: string;
@@ -73,6 +74,7 @@ async function executeGroqRequest(
   apiKey: string,
   model: string,
   messages: GroqMessageItem[],
+  stream: boolean,
   signal: AbortSignal
 ): Promise<Response> {
   return fetch(GROQ_API_URL, {
@@ -84,7 +86,7 @@ async function executeGroqRequest(
     body: JSON.stringify({
       model,
       messages,
-      stream: true,
+      stream,
     }),
     signal,
   });
@@ -151,6 +153,80 @@ async function consumeGroqResponse(
   return accumulated;
 }
 
+async function tryLocalServerFallback(options: StreamGroqOptions): Promise<string | null> {
+  const { history, userText, userName, attachment, signal, onModelChange, onToken } = options;
+
+  try {
+    const serverMessages = [
+      ...history.map((m) => ({
+        role: m.role === 'assistant' ? ('model' as const) : ('user' as const),
+        text: m.content,
+      })),
+      { role: 'user' as const, text: userText },
+    ];
+
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: serverMessages,
+        userName,
+        attachment,
+      }),
+      signal,
+    });
+
+    const contentType = res.headers.get('content-type') || '';
+    if (!res.ok || !res.body || !contentType.includes('text/event-stream')) {
+      return null;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let sseBuffer = '';
+    let accumulated = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      sseBuffer += decoder.decode(value, { stream: true });
+      const events = sseBuffer.split('\n\n');
+      sseBuffer = events.pop() ?? '';
+
+      for (const evt of events) {
+        for (const line of evt.split('\n')) {
+          if (!line.startsWith('data: ')) continue;
+          const raw = line.slice(6).trim();
+          if (!raw) continue;
+          try {
+            const payload = JSON.parse(raw) as {
+              model?: string;
+              text?: string;
+              error?: string;
+            };
+            if (payload.model) onModelChange(payload.model);
+            if (payload.error) {
+              console.error('Server proxy Groq error:', payload.error);
+              return null;
+            }
+            if (payload.text) {
+              accumulated += payload.text;
+              onToken(accumulated);
+            }
+          } catch {
+            // Ignore partial frame
+          }
+        }
+      }
+    }
+
+    return accumulated || null;
+  } catch {
+    return null;
+  }
+}
+
 export async function streamGroqWithFallback(options: StreamGroqOptions): Promise<string> {
   const {
     apiKey,
@@ -164,13 +240,12 @@ export async function streamGroqWithFallback(options: StreamGroqOptions): Promis
     onToken,
   } = options;
 
-  let textMessages: GroqMessageItem[];
-  let multimodalMessages: GroqMessageItem[] | null = null;
+  let finalUserContent = userText;
 
   if (attachment?.kind === 'document') {
     const safeName = attachment.name || 'document';
     const docText = (attachment.text ?? '').trim();
-    const docPrompt = docText
+    finalUserContent = docText
       ? [
           `The user uploaded a document named "${safeName}".`,
           'Here is the text inside the document:',
@@ -186,99 +261,55 @@ export async function streamGroqWithFallback(options: StreamGroqOptions): Promis
           `The user uploaded a document named "${safeName}", but no readable text was found inside.`,
           `Start your reply by saying "I can see your file" and answer helpfully based on the file name "${safeName}" and the message: "${userText || 'Please review this document.'}".`,
         ].join('\n');
-
-    textMessages = [
-      { role: 'system', content: systemPrompt },
-      ...history,
-      { role: 'user', content: docPrompt },
-    ];
   } else if (attachment?.kind === 'image') {
     const safeName = attachment.name || 'image';
     const question = userText || 'Please describe this image in detail.';
-
-    if (attachment.dataUrl) {
-      multimodalMessages = [
-        { role: 'system', content: systemPrompt },
-        ...history,
-        {
-          role: 'user',
-          content: [
-            { type: 'text', text: question },
-            { type: 'image_url', image_url: { url: attachment.dataUrl } },
-          ],
-        },
-      ];
-    }
-
-    const fallbackPrompt = [
+    // openai/gpt-oss-20b and openai/gpt-oss-120b accept string content only,
+    // so respond seamlessly with "I can see your file" without triggering a 400 error.
+    finalUserContent = [
       `The user uploaded an image file named "${safeName}".`,
       `Start your response by saying "I can see your file" and answer helpfully based on the file name "${safeName}" and the user's message: "${question}".`,
     ].join('\n');
-
-    textMessages = [
-      { role: 'system', content: systemPrompt },
-      ...history,
-      { role: 'user', content: fallbackPrompt },
-    ];
-  } else {
-    textMessages = [
-      { role: 'system', content: systemPrompt },
-      ...history,
-      { role: 'user', content: userText },
-    ];
   }
+
+  const messages: GroqMessageItem[] = [
+    { role: 'system', content: systemPrompt },
+    ...history.map((m) => ({
+      role: m.role,
+      content: String(m.content),
+    })),
+    { role: 'user', content: finalUserContent },
+  ];
 
   for (let i = 0; i < GROQ_MODELS.length; i++) {
     const model = GROQ_MODELS[i];
     onModelChange(model);
 
-    // If image attachment is present, try multimodal payload first
-    if (multimodalMessages) {
-      const visionRes = await executeGroqRequest(apiKey, model, multimodalMessages, signal);
-      if (visionRes.ok) {
-        return consumeGroqResponse(visionRes, onToken);
+    let res: Response;
+    try {
+      res = await executeGroqRequest(apiKey, model, messages, true, signal);
+    } catch (firstFetchErr) {
+      if (firstFetchErr instanceof Error && firstFetchErr.name === 'AbortError') {
+        throw firstFetchErr;
       }
-
-      const visionErrBody = await readErrorBody(visionRes);
-      console.error(`Groq vision attempt failed (${model}, status ${visionRes.status}):`, visionErrBody);
-
-      if (visionRes.status === 401) {
-        throw new GroqUserFacingError('API Key is wrong');
-      }
-
-      // If vision is unsupported (400/404/422), seamlessly fall back to text ("I can see your file") on the same model
-      if (visionRes.status === 400 || visionRes.status === 404 || visionRes.status === 422) {
-        const textFallbackRes = await executeGroqRequest(apiKey, model, textMessages, signal);
-        if (textFallbackRes.ok) {
-          return consumeGroqResponse(textFallbackRes, onToken);
+      console.warn('Direct streaming fetch failed, retrying non-streaming:', firstFetchErr);
+      try {
+        res = await executeGroqRequest(apiKey, model, messages, false, signal);
+      } catch (secondFetchErr) {
+        if (secondFetchErr instanceof Error && secondFetchErr.name === 'AbortError') {
+          throw secondFetchErr;
         }
-
-        const fallbackErrBody = await readErrorBody(textFallbackRes);
-        console.error(
-          `Groq fallback attempt failed (${model}, status ${textFallbackRes.status}):`,
-          fallbackErrBody
+        console.error('Direct Groq fetch failed:', secondFetchErr);
+        const proxyReply = await tryLocalServerFallback(options);
+        if (proxyReply) {
+          return proxyReply;
+        }
+        throw new GroqUserFacingError(
+          'Could not connect to Groq right now. Please check your internet connection and try again.'
         );
-
-        if (textFallbackRes.status === 401) {
-          throw new GroqUserFacingError('API Key is wrong');
-        }
-        if (
-          (textFallbackRes.status === 400 || textFallbackRes.status === 404) &&
-          i < GROQ_MODELS.length - 1
-        ) {
-          onStatusMessage('Model not available, trying another model');
-          continue;
-        }
-        if (textFallbackRes.status === 400 || textFallbackRes.status === 404) {
-          throw new GroqUserFacingError('Model not available, trying another model');
-        }
-        throw new GroqUserFacingError('Could not get a response from Groq. Please try again.');
       }
-
-      throw new GroqUserFacingError('Could not get a response from Groq. Please try again.');
     }
 
-    const res = await executeGroqRequest(apiKey, model, textMessages, signal);
     if (res.ok) {
       return consumeGroqResponse(res, onToken);
     }

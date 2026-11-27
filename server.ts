@@ -84,19 +84,6 @@ function isModelUnavailableError(status: number, message: string): boolean {
   );
 }
 
-function isVisionUnsupportedError(status: number, message: string): boolean {
-  const lower = message.toLowerCase();
-  return (
-    status === 400 ||
-    status === 422 ||
-    lower.includes('image') ||
-    lower.includes('vision') ||
-    lower.includes('multimodal') ||
-    lower.includes('content') ||
-    lower.includes('unsupported')
-  );
-}
-
 async function callGroqStream(
   apiKey: string,
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: unknown }>,
@@ -290,72 +277,22 @@ async function startServer(): Promise<void> {
         const promptText =
           latestUserText || 'Please describe this image in detail and explain what you see.';
 
-        // Try sending multimodal image payload first if dataUrl is present
-        if (attachment.dataUrl) {
-          const visionMessages = [
-            { role: 'system' as const, content: systemPrompt },
-            ...priorHistory,
-            {
-              role: 'user' as const,
-              content: [
-                { type: 'text', text: promptText },
-                { type: 'image_url', image_url: { url: attachment.dataUrl } },
-              ],
-            },
-          ];
+        const fallbackTextPrompt = [
+          `The user uploaded an image file named "${safeImageName}".`,
+          `Start your response by saying "I can see your file" (mentioning "${safeImageName}") and respond helpfully based on the file name and the user's message: "${promptText}".`,
+        ].join('\n');
 
-          const visionResult = await callGroqStream(apiKey, visionMessages, upstreamAbort.signal);
-          if (visionResult.response) {
-            workingResponse = visionResult.response;
-            chosenModel = visionResult.modelUsed;
-          } else if (isVisionUnsupportedError(visionResult.errorStatus, visionResult.errorMessage)) {
-            // Vision not supported on this model: fall back smoothly with "I can see your file" and NO error
-            const fallbackTextPrompt = [
-              `The user uploaded an image file named "${safeImageName}".`,
-              `Start your response by saying "I can see your file" (mentioning "${safeImageName}") and respond helpfully based on the file name and the user's message: "${promptText}".`,
-            ].join('\n');
+        const imageTextMessages = [
+          { role: 'system' as const, content: systemPrompt },
+          ...priorHistory,
+          { role: 'user' as const, content: fallbackTextPrompt },
+        ];
 
-            const fallbackMessages = [
-              { role: 'system' as const, content: systemPrompt },
-              ...priorHistory,
-              { role: 'user' as const, content: fallbackTextPrompt },
-            ];
-
-            const fallbackResult = await callGroqStream(
-              apiKey,
-              fallbackMessages,
-              upstreamAbort.signal
-            );
-            workingResponse = fallbackResult.response;
-            chosenModel = fallbackResult.modelUsed;
-            lastErrorStatus = fallbackResult.errorStatus;
-            lastErrorMessage = fallbackResult.errorMessage;
-          } else {
-            lastErrorStatus = visionResult.errorStatus;
-            lastErrorMessage = visionResult.errorMessage;
-          }
-        } else {
-          const fallbackTextPrompt = [
-            `The user uploaded an image file named "${safeImageName}".`,
-            `Start your response by saying "I can see your file" (mentioning "${safeImageName}") and respond helpfully based on the file name and the user's message: "${promptText}".`,
-          ].join('\n');
-
-          const fallbackMessages = [
-            { role: 'system' as const, content: systemPrompt },
-            ...priorHistory,
-            { role: 'user' as const, content: fallbackTextPrompt },
-          ];
-
-          const fallbackResult = await callGroqStream(
-            apiKey,
-            fallbackMessages,
-            upstreamAbort.signal
-          );
-          workingResponse = fallbackResult.response;
-          chosenModel = fallbackResult.modelUsed;
-          lastErrorStatus = fallbackResult.errorStatus;
-          lastErrorMessage = fallbackResult.errorMessage;
-        }
+        const result = await callGroqStream(apiKey, imageTextMessages, upstreamAbort.signal);
+        workingResponse = result.response;
+        chosenModel = result.modelUsed;
+        lastErrorStatus = result.errorStatus;
+        lastErrorMessage = result.errorMessage;
       } else {
         const textMessages = [
           { role: 'system' as const, content: systemPrompt },

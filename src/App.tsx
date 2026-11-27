@@ -655,6 +655,7 @@ export default function App() {
         systemPrompt: buildSystemPrompt(settings.userName),
         history: previousHistory,
         userText: displayUserText,
+        userName: settings.userName,
         attachment: currentAttachment
           ? {
               kind: currentAttachment.kind,
