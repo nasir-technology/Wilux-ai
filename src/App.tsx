@@ -28,6 +28,12 @@ import { ChatBubble } from './components/ChatBubble';
 import { TypingIndicator } from './components/TypingIndicator';
 import { SettingsModal } from './components/SettingsModal';
 import { AboutModal } from './components/AboutModal';
+import {
+  extractPdfTextFromFile,
+  getGroqApiKey,
+  GroqUserFacingError,
+  streamGroqWithFallback,
+} from './utils/groqClient';
 
 const STORAGE_SESSIONS_KEY = 'wilux_sessions_v1';
 const STORAGE_ACTIVE_KEY = 'wilux_active_session_v1';
@@ -91,6 +97,14 @@ const SUGGESTION_CHIPS = [
     icon: Sparkles,
   },
 ] as const;
+
+function buildSystemPrompt(userName?: string): string {
+  const safeName = userName?.trim().slice(0, 40);
+  if (safeName) {
+    return `You are WILUX BOT, a fast, smart and helpful AI assistant. The user's name is ${safeName}.`;
+  }
+  return 'You are WILUX BOT, a fast, smart and helpful AI assistant.';
+}
 
 function makeId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -224,7 +238,9 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [isWaitingFirstToken, setIsWaitingFirstToken] = useState(false);
   const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
-  const [isOnline, setIsOnline] = useState(true);
+  const [isOnline, setIsOnline] = useState<boolean>(() =>
+    typeof navigator !== 'undefined' ? navigator.onLine : true
+  );
   const [activeModel, setActiveModel] = useState('openai/gpt-oss-20b');
   const [isListening, setIsListening] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
@@ -272,7 +288,7 @@ export default function App() {
     }
   }, [settings]);
 
-  // Persist sessions & active session safely (handles image quota limits gracefully)
+  // Persist sessions & active session safely
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_SESSIONS_KEY, JSON.stringify(sessions));
@@ -291,34 +307,20 @@ export default function App() {
         }));
         localStorage.setItem(STORAGE_SESSIONS_KEY, JSON.stringify(compact));
       } catch {
-        // Ignore if storage is completely full
+        // Ignore if storage is full
       }
     }
   }, [sessions, resolvedActiveId]);
 
-  // Live server health & active Groq model check
+  // Browser online/offline status for Online green dot
   useEffect(() => {
-    let active = true;
-    const checkHealth = async () => {
-      try {
-        const res = await fetch('/api/health');
-        if (!active) return;
-        setIsOnline(res.ok);
-        if (res.ok) {
-          const data = (await res.json()) as { model?: string };
-          if (active && typeof data.model === 'string' && data.model.trim()) {
-            setActiveModel(data.model.trim());
-          }
-        }
-      } catch {
-        if (active) setIsOnline(false);
-      }
-    };
-    void checkHealth();
-    const interval = setInterval(() => void checkHealth(), 30000);
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
     return () => {
-      active = false;
-      clearInterval(interval);
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
     };
   }, []);
 
@@ -459,7 +461,8 @@ export default function App() {
         dataUrl,
       });
       textareaRef.current?.focus();
-    } catch {
+    } catch (err) {
+      console.error('Image read error:', err);
       showToast('Could not load that image. Try another one!');
     }
   };
@@ -494,16 +497,22 @@ export default function App() {
           text: text.slice(0, 20000),
         });
       } else {
-        const dataUrl = await readFileAsDataUrl(file);
+        let extractedText = '';
+        try {
+          extractedText = await extractPdfTextFromFile(file);
+        } catch (pdfErr) {
+          console.error('PDF extraction fallback:', pdfErr);
+        }
         setPendingAttachment({
           kind: 'document',
           name: file.name,
           mimeType: 'application/pdf',
-          dataUrl,
+          text: extractedText.slice(0, 20000),
         });
       }
       textareaRef.current?.focus();
-    } catch {
+    } catch (err) {
+      console.error('Document read error:', err);
       showToast('Could not read that document. Try another file!');
     }
   };
@@ -537,22 +546,18 @@ export default function App() {
       createdAt: Date.now(),
     };
 
-    const previousMessages = activeSession.messages
+    const previousHistory = activeSession.messages
       .filter((m) => !m.isError)
+      .slice(-14)
       .map((m) => ({
-        role: m.role,
-        text:
+        role: (m.role === 'model' ? 'assistant' : 'user') as 'assistant' | 'user',
+        content:
           m.text ||
           (m.attachment
             ? `[Uploaded ${m.attachment.kind}: ${m.attachment.name}]`
             : ''),
       }))
-      .filter((m) => m.text.trim().length > 0);
-
-    const conversationPayload = [
-      ...previousMessages,
-      { role: 'user' as const, text: displayUserText },
-    ];
+      .filter((m) => m.content.trim().length > 0);
 
     const isFirstMessage = activeSession.messages.length === 0;
     const botMessageId = makeId();
@@ -577,6 +582,28 @@ export default function App() {
       setPendingAttachment(null);
     }
     setIsUploadMenuOpen(false);
+
+    // Check Vercel / Vite Groq API Key before making any request
+    const apiKey = getGroqApiKey();
+    if (!apiKey) {
+      console.error('Groq API Key is missing in Vercel Environment Variables');
+      const missingKeyMsg: ChatMessage = {
+        id: botMessageId,
+        role: 'model',
+        text: 'Groq API Key is missing in Vercel Environment Variables',
+        createdAt: Date.now(),
+        isError: true,
+      };
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === targetSessionId
+            ? { ...s, messages: [...s.messages, missingKeyMsg], updatedAt: Date.now() }
+            : s
+        )
+      );
+      return;
+    }
+
     setIsGenerating(true);
     setIsWaitingFirstToken(true);
     setStreamingMessageId(null);
@@ -584,159 +611,82 @@ export default function App() {
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
-    let botText = '';
     let hasInsertedBotMessage = false;
 
-    const ensureBotMessageInserted = (initialText: string, isError = false) => {
-      if (hasInsertedBotMessage) return;
-      hasInsertedBotMessage = true;
+    const upsertBotMessage = (nextText: string, isError = false) => {
       setIsWaitingFirstToken(false);
       setStreamingMessageId(botMessageId);
-      const botMsg: ChatMessage = {
-        id: botMessageId,
-        role: 'model',
-        text: initialText,
-        createdAt: Date.now(),
-        isError,
-      };
-      setSessions((prev) =>
-        prev.map((s) =>
-          s.id === targetSessionId
-            ? { ...s, messages: [...s.messages, botMsg], updatedAt: Date.now() }
-            : s
-        )
-      );
-    };
-
-    const updateBotMessage = (nextText: string) => {
-      setSessions((prev) =>
-        prev.map((s) =>
-          s.id === targetSessionId
-            ? {
-                ...s,
-                messages: s.messages.map((m) =>
-                  m.id === botMessageId ? { ...m, text: nextText } : m
-                ),
-                updatedAt: Date.now(),
-              }
-            : s
-        )
-      );
+      if (!hasInsertedBotMessage) {
+        hasInsertedBotMessage = true;
+        const botMsg: ChatMessage = {
+          id: botMessageId,
+          role: 'model',
+          text: nextText,
+          createdAt: Date.now(),
+          isError,
+        };
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === targetSessionId
+              ? { ...s, messages: [...s.messages, botMsg], updatedAt: Date.now() }
+              : s
+          )
+        );
+      } else {
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === targetSessionId
+              ? {
+                  ...s,
+                  messages: s.messages.map((m) =>
+                    m.id === botMessageId ? { ...m, text: nextText, isError } : m
+                  ),
+                  updatedAt: Date.now(),
+                }
+              : s
+          )
+        );
+      }
     };
 
     try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: conversationPayload,
-          userName: settings.userName,
-          attachment: currentAttachment
-            ? {
-                kind: currentAttachment.kind,
-                name: currentAttachment.name,
-                mimeType: currentAttachment.mimeType,
-                dataUrl: currentAttachment.dataUrl,
-                text: currentAttachment.text,
-              }
-            : undefined,
-        }),
+      const fullReply = await streamGroqWithFallback({
+        apiKey,
+        systemPrompt: buildSystemPrompt(settings.userName),
+        history: previousHistory,
+        userText: displayUserText,
+        attachment: currentAttachment
+          ? {
+              kind: currentAttachment.kind,
+              name: currentAttachment.name,
+              mimeType: currentAttachment.mimeType,
+              dataUrl: currentAttachment.dataUrl,
+              text: currentAttachment.text,
+            }
+          : undefined,
         signal: controller.signal,
+        onModelChange: (model) => setActiveModel(model),
+        onStatusMessage: (statusText) => upsertBotMessage(statusText, false),
+        onToken: (textSoFar) => upsertBotMessage(textSoFar, false),
       });
 
-      if (!response.ok) {
-        let errorMsg = 'Something went wrong while contacting Groq. Please try again.';
-        try {
-          const errJson = (await response.json()) as { error?: string };
-          if (errJson.error) errorMsg = errJson.error;
-        } catch {
-          // Use fallback message
-        }
-        ensureBotMessageInserted(errorMsg, true);
-        return;
-      }
-
-      if (!response.body) {
-        ensureBotMessageInserted('No response stream received from server.', true);
-        return;
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let sseBuffer = '';
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-
-        sseBuffer += decoder.decode(value, { stream: true });
-        const events = sseBuffer.split('\n\n');
-        sseBuffer = events.pop() ?? '';
-
-        for (const evt of events) {
-          const lines = evt.split('\n');
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue;
-            const jsonRaw = line.slice(6).trim();
-            if (!jsonRaw) continue;
-            try {
-              const payload = JSON.parse(jsonRaw) as {
-                model?: string;
-                text?: string;
-                error?: string;
-                done?: boolean;
-              };
-
-              if (payload.model) {
-                setActiveModel(payload.model);
-              }
-
-              if (payload.error) {
-                if (!hasInsertedBotMessage) {
-                  ensureBotMessageInserted(payload.error, true);
-                } else {
-                  botText += `\n\n${payload.error}`;
-                  updateBotMessage(botText);
-                }
-                return;
-              }
-
-              if (payload.text) {
-                botText += payload.text;
-                if (!hasInsertedBotMessage) {
-                  ensureBotMessageInserted(botText, false);
-                } else {
-                  updateBotMessage(botText);
-                }
-              }
-            } catch {
-              // Ignore malformed partial SSE frames
-            }
-          }
-        }
-      }
-
-      if (!hasInsertedBotMessage && !botText) {
-        ensureBotMessageInserted(
-          'Network blinked—please try sending that message again.',
-          true
-        );
+      if (!fullReply && !hasInsertedBotMessage) {
+        upsertBotMessage('No reply received from Groq. Please try again.', true);
       }
     } catch (err: unknown) {
       if (err instanceof Error && err.name === 'AbortError') {
         if (!hasInsertedBotMessage) {
           setIsWaitingFirstToken(false);
         }
+      } else if (err instanceof GroqUserFacingError) {
+        console.error('Groq chat error:', err.message);
+        upsertBotMessage(err.message, true);
       } else {
-        const msg =
-          err instanceof Error
-            ? `Connection error: ${err.message}`
-            : 'Network error. Check your connection and try again.';
-        if (!hasInsertedBotMessage) {
-          ensureBotMessageInserted(msg, true);
-        } else {
-          updateBotMessage(`${botText}\n\n${msg}`);
-        }
+        console.error('Groq network/unexpected error:', err);
+        upsertBotMessage(
+          'Could not reach Groq right now. Please check your connection and try again.',
+          true
+        );
       }
     } finally {
       setIsGenerating(false);
@@ -861,7 +811,7 @@ export default function App() {
                     }`}
                     aria-hidden="true"
                   />
-                  <span>{isOnline ? 'Online' : 'Reconnecting'}</span>
+                  <span>{isOnline ? 'Online' : 'Offline'}</span>
                 </span>
                 <span className="hidden sm:inline text-zinc-300 dark:text-zinc-700" aria-hidden="true">
                   ·
