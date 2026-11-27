@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>WILUX BOT — AI Assistant by WILUX LAB</title>
+    <meta name="description" content="Friendly Nigerian AI assistant by WILUX LAB — smart, fast, and built in Port Harcourt style." />
+    <meta property="og:title" content="WILUX BOT — AI Assistant by WILUX LAB" />
+    <meta property="og:description" content="Friendly Nigerian AI assistant by WILUX LAB — smart, fast, and built in Port Harcourt style." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;600;700&family=JetBrains+Mono:wght@400;500&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem('wilux_theme');
+          if (saved === 'light') {
+            document.documentElement.classList.remove('dark');
+          } else {
+            document.documentElement.classList.add('dark');
+          }
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body class="bg-[#FAFAFA] text-[#09090B] dark:bg-[#0A0A0A] dark:text-[#FAFAFA] antialiased selection:bg-[#8B5CF6]/30">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
